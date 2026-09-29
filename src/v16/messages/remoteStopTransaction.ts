@@ -2,6 +2,8 @@ import { z } from "zod";
 import { generateOCMF, getOCMFPublicKey } from "../../ocmfGenerator";
 import { type OcppCall, OcppIncoming } from "../../ocppMessage";
 import type { VCP } from "../../vcp";
+import { buildMeterSampledValues } from "../meterSample";
+import { meterValuesOcppMessage } from "./meterValues";
 import { statusNotificationOcppMessage } from "./statusNotification";
 import { stopTransactionOcppMessage } from "./stopTransaction";
 
@@ -39,38 +41,76 @@ class RemoteStopTransactionOcppMessage extends OcppIncoming<
       idTag: transaction.idTag,
     });
 
+    const endElectricals =
+      vcp.transactionManager.getEndElectricals(transactionId);
     vcp.send(
-      stopTransactionOcppMessage.request({
+      meterValuesOcppMessage.request({
+        connectorId: transaction.connectorId,
         transactionId: transactionId,
-        meterStop: Math.floor(
-          vcp.transactionManager.getMeterValue(transactionId),
-        ),
-        timestamp: new Date().toISOString(),
-        transactionData: [
+        meterValue: [
           {
             timestamp: new Date().toISOString(),
-            sampledValue: [
-              {
-                value: JSON.stringify({
-                  signedMeterData: Buffer.from(ocmf).toString("base64"),
-                  encodingMethod: "OCMF",
-                  publicKey: getOCMFPublicKey().toString("base64"),
-                }),
-                format: "SignedData",
-                context: "Transaction.End",
-              },
-            ],
+            sampledValue: buildMeterSampledValues(
+              endElectricals,
+              "Transaction.End",
+            ),
           },
         ],
       }),
     );
+
+    // Send Finishing status FIRST (transaction is ending)
     vcp.send(
       statusNotificationOcppMessage.request({
         connectorId: transaction.connectorId,
         errorCode: "NoError",
-        status: "Available",
+        status: "Finishing",
       }),
     );
+    
+    // Small delay to ensure Finishing status is processed before StopTransaction
+    setTimeout(() => {
+      vcp.send(
+        stopTransactionOcppMessage.request({
+          transactionId: transactionId,
+          meterStop: Math.floor(
+            vcp.transactionManager.getMeterValue(transactionId),
+          ),
+          timestamp: new Date().toISOString(),
+          // Removed transactionData - it was causing NestJS to silently fail processing
+        }),
+      );
+      
+      // Stop the transaction to clear MeterValues interval
+      vcp.transactionManager.stopTransaction(transactionId);
+      
+      // Simulate idle period - car is plugged in but not charging (idle fees accumulating)
+      // Stay in Finishing status during this time
+      const idlePeriodMinutes = parseInt(process.env.IDLE_PERIOD_MINUTES || "10");
+      console.log(`Simulating idle period: ${idlePeriodMinutes} minutes before sending Preparing status`);
+      
+      setTimeout(() => {
+        // After idle period, send Preparing status (charger will be unlocked)
+        vcp.send(
+          statusNotificationOcppMessage.request({
+            connectorId: transaction.connectorId,
+            errorCode: "NoError",
+            status: "Available",
+          }),
+        );
+        
+        // Wait for the preparing period before sending Available status
+        // setTimeout(() => {
+        //   vcp.send(
+        //     statusNotificationOcppMessage.request({
+        //       connectorId: transaction.connectorId,
+        //       errorCode: "NoError",
+        //       status: "Available",
+        //     }),
+        //   );
+        // }, 240000); // 4 minutes in preparing state
+      }, idlePeriodMinutes * 60 * 1000); // Idle period in milliseconds
+    }, 500); // 500ms delay to ensure Finishing is processed first
   };
 }
 

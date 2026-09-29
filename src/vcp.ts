@@ -1,7 +1,8 @@
 import * as util from "node:util";
+import type { Server } from "node:http";
 import { WebSocket } from "ws";
 
-import { serve, type ServerType } from "@hono/node-server";
+import { serve } from "@hono/node-server";
 import { zValidator } from "@hono/zod-validator";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -22,7 +23,6 @@ import {
 } from "./schemaValidator";
 import { TransactionManager } from "./transactionManager";
 import { heartbeatOcppMessage } from "./v16/messages/heartbeat";
-import { close } from "./close";
 
 interface VCPOptions {
   ocppVersion: OcppVersion;
@@ -42,13 +42,10 @@ interface LogEntry {
 
 export class VCP {
   private ws?: WebSocket;
-  private adminServer?: ServerType;
   private messageHandler: OcppMessageHandler;
-  private heartbeatInterval?: NodeJS.Timeout;
+  private adminServer?: Server;
 
   private isFinishing = false;
-
-  private postMessageActions: Record<string, () => void | Promise<void>> = {};
 
   transactionManager = new TransactionManager();
 
@@ -57,6 +54,34 @@ export class VCP {
     if (vcpOptions.adminPort) {
       const adminApi = new Hono();
       adminApi.get("/health", (c) => c.text("OK"));
+      adminApi.get("/transactions", (c) => {
+        const transactions = Array.from(this.transactionManager.transactions.entries()).map(([id, tx]) => ({
+          transactionId: id,
+          connectorId: tx.connectorId,
+          idTag: tx.idTag,
+          meterValue: Math.floor(this.transactionManager.getMeterValue(id)),
+          startedAt: tx.startedAt.toISOString(),
+        }));
+        return c.json({ transactions });
+      });
+      adminApi.get("/transaction/:id/meter", (c) => {
+        const id = Number.parseInt(c.req.param("id"));
+        const transaction = this.transactionManager.transactions.get(id);
+        if (!transaction) {
+          return c.json({ error: "Transaction not found" }, 404);
+        }
+        const electricals = this.transactionManager.getLiveElectricals(id);
+        return c.json({
+          transactionId: id,
+          meterValue: Math.floor(electricals.meterValue),
+          soc: electricals.soc,
+          voltage: electricals.voltage,
+          current: electricals.current,
+          powerWatts: electricals.powerWatts,
+          outletTemp: electricals.outletTemp,
+          bodyTemp: electricals.bodyTemp,
+        });
+      });
       adminApi.post(
         "/execute",
         zValidator(
@@ -76,7 +101,37 @@ export class VCP {
         fetch: adminApi.fetch,
         port: vcpOptions.adminPort,
       });
+      this.adminServer.on("error", (err: NodeJS.ErrnoException) => {
+        if (err.code === "EADDRINUSE") {
+          logger.error(
+            `Admin port ${vcpOptions.adminPort} is already in use. Run "npm run plug2" to auto-restart, or stop the existing process.`,
+          );
+        } else {
+          logger.error(`Admin server error: ${err.message}`);
+        }
+        process.exit(1);
+      });
+      this.setupShutdownHandlers();
     }
+  }
+
+  private setupShutdownHandlers() {
+    const shutdown = () => {
+      if (this.isFinishing) return;
+      this.isFinishing = true;
+      logger.info("Shutting down VCP...");
+      if (this.ws) {
+        this.ws.close();
+        this.ws = undefined;
+      }
+      if (this.adminServer) {
+        this.adminServer.close(() => process.exit(0));
+      } else {
+        process.exit(0);
+      }
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
   }
 
   async connect(): Promise<void> {
@@ -108,11 +163,6 @@ export class VCP {
       this.ws.on("close", (code: number, reason: string) =>
         this._onClose(code, reason),
       );
-      this.ws.on("error", (error: Error) => {
-        logger.error("Websocket error:");
-        logger.error(error);
-        close(this);
-      });
     });
   }
 
@@ -169,10 +219,7 @@ export class VCP {
   }
 
   configureHeartbeat(interval: number) {
-    this.heartbeatInterval = setInterval(() => {
-      if (!this.ws) {
-        return;
-      }
+    setInterval(() => {
       this.send(heartbeatOcppMessage.request({}));
     }, interval);
   }
@@ -186,14 +233,7 @@ export class VCP {
     this.isFinishing = true;
     this.ws.close();
     this.ws = undefined;
-    if (this.heartbeatInterval) {
-      clearInterval(this.heartbeatInterval);
-      this.heartbeatInterval = undefined;
-    }
-    if (this.adminServer) {
-      this.adminServer.close();
-      this.adminServer = undefined;
-    }
+    process.exit(1);
   }
 
   async getDiagnosticData(): Promise<LogEntry[]> {
@@ -239,13 +279,6 @@ export class VCP {
     }
   }
 
-  async postMessageAction(
-    action: string,
-    callback: () => void | Promise<void>,
-  ) {
-    this.postMessageActions[action] = callback;
-  }
-
   private _onMessage(message: string) {
     logger.info(`Receive message ⬅️  ${message}`);
     const data = JSON.parse(message);
@@ -254,17 +287,10 @@ export class VCP {
       const [messageId, action, payload] = rest;
       validateOcppIncomingRequest(this.vcpOptions.ocppVersion, action, payload);
       this.messageHandler.handleCall(this, { messageId, action, payload });
-      if (this.postMessageActions[action]) {
-        logger.info(`Executing postMessageAction for ${action}`);
-        this.postMessageActions[action]();
-      }
     } else if (type === 3) {
       const [messageId, payload] = rest;
       const enqueuedCall = ocppOutbox.get(messageId);
       if (!enqueuedCall) {
-        if (process.env.CONTINUE_ON_UNKNOWN_MESSAGE_ID) {
-          return;
-        }
         throw new Error(
           `Received CallResult for unknown messageId=${messageId}`,
         );
@@ -297,6 +323,6 @@ export class VCP {
       return;
     }
     logger.info(`Connection closed. code=${code}, reason=${reason}`);
-    close(this);
+    process.exit();
   }
 }
